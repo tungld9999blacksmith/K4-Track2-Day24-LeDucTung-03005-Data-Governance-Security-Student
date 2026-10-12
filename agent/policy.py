@@ -34,7 +34,12 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+PRINCIPALS_FILE = Path(__file__).resolve().parent.parent / "data" / "principals.json"
 
 
 @dataclass(frozen=True)
@@ -51,5 +56,47 @@ class PolicyContext:
     expires_at: str = ""
 
 
+def load_principals(path: Path | None = None) -> dict[str, dict]:
+    """Nguồn tin cậy mô phỏng cho OBO — không đọc principal từ nơi nào khác."""
+    return json.loads((path or PRINCIPALS_FILE).read_text(encoding="utf-8"))
+
+
+def _parse_expiry(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    # Rule tối thiểu đứng đầu: không quyền OBO nào mở được restricted + egress.
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, (f"deny: restricted data with egress enabled "
+                       f"(tool={context.requested_tool or 'unknown'}, owner={context.agent_owner})")
+
+    principal = load_principals().get(context.principal_id)
+    if principal is None:
+        return False, f"deny: unknown principal {context.principal_id!r}"
+
+    expires_at = _parse_expiry(context.expires_at)
+    if expires_at is None:
+        return False, f"deny: missing or invalid expires_at {context.expires_at!r}"
+    if expires_at <= datetime.now(timezone.utc):
+        return False, f"deny: delegation expired at {context.expires_at}"
+
+    if context.request_purpose not in principal["purposes"]:
+        return False, (f"deny: purpose {context.request_purpose!r} not allowed "
+                       f"for principal {context.principal_id}")
+
+    effective = set(principal["allowed_tools"]) & set(context.agent_scopes)
+    if context.delegation_depth > 0:
+        effective &= set(context.parent_scopes)
+    if context.requested_tool not in effective:
+        return False, (f"deny: tool {context.requested_tool!r} outside effective scope "
+                       f"{sorted(effective)} for principal {context.principal_id} "
+                       f"(depth={context.delegation_depth})")
+
+    return True, (f"allow: {context.requested_tool} for {context.principal_id} "
+                  f"purpose={context.request_purpose} class={context.data_classification} "
+                  f"egress={context.egress_enabled}")
